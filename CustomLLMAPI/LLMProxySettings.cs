@@ -38,6 +38,7 @@ public class LLMProxySettings : MonoBehaviour
     public TMP_InputField apiKeyInput, endpointInput, modelInput, portInput;
     public TMP_Dropdown templateDropdown;
     public Button saveButton, closeButton;
+    public Toggle enableHidePanelOnStartToggle;
     public TMP_Text debugText;
 
     private void Awake()
@@ -54,6 +55,14 @@ public class LLMProxySettings : MonoBehaviour
         LoadFromDisk();
         InitializeUI();
         ApplyAllSettings();
+        if (data.hidePanelOnStart && targetCanvas != null)
+        {
+            targetCanvas.gameObject.SetActive(false);
+        }
+        else
+        {
+            AddMyUIToGameMenuList();
+        }
     }
 
     private void OnApplicationQuit()
@@ -95,6 +104,7 @@ public class LLMProxySettings : MonoBehaviour
 
         // Add listeners
         enableToggle.onValueChanged.AddListener(OnEnableChanged);
+        enableHidePanelOnStartToggle.onValueChanged.AddListener(OnEnableHidePanelOnStartChanged);
         providerDropdown.onValueChanged.AddListener(OnProviderChanged);
         presetDropdown.onValueChanged.AddListener(OnPresetChanged);
         addPresetButton.onClick.AddListener(AddPreset);
@@ -171,6 +181,7 @@ public class LLMProxySettings : MonoBehaviour
         var d = inst.data;
 
         inst.enableToggle.isOn = d.enableRemote;
+        inst.enableHidePanelOnStartToggle.isOn = d.hidePanelOnStart;
         inst.portInput.text = d.proxyPort.ToString();
         inst.RefreshPresetDropdown();
         inst.LoadCurrentPresetToUI();
@@ -235,6 +246,10 @@ public class LLMProxySettings : MonoBehaviour
                 llmCharacter.stream = true;
             }
         }
+    }
+    private void OnEnableHidePanelOnStartChanged(bool isEnabled)
+    {
+        data.hidePanelOnStart = isEnabled;
     }
 
     private void OnProviderChanged(int value)
@@ -411,6 +426,7 @@ public class LLMProxySettings : MonoBehaviour
     {
         public string version = "1.0";
         public bool enableRemote = false;
+        public bool hidePanelOnStart = false;
         public List<APIConfigData> apiConfigs = new List<APIConfigData>();
         public int activeConfigIndex = 0;
         public int proxyPort = 13333;
