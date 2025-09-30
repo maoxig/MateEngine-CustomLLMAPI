@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using TMPro;
 using UnityEngine;
+using UnityEngine.EventSystems;
 using UnityEngine.UI;
 
 public class LLMProxySettings : MonoBehaviour
@@ -171,7 +172,6 @@ public class LLMProxySettings : MonoBehaviour
 
         inst.enableToggle.isOn = d.enableRemote;
         inst.portInput.text = d.proxyPort.ToString();
-        inst.remoteConfigGroup.SetActive(d.enableRemote);
         inst.RefreshPresetDropdown();
         inst.LoadCurrentPresetToUI();
         inst.OnEnableChanged(d.enableRemote);
@@ -217,7 +217,6 @@ public class LLMProxySettings : MonoBehaviour
     private void OnEnableChanged(bool isEnabled)
     {
         data.enableRemote = isEnabled;
-        remoteConfigGroup.SetActive(isEnabled);
         if (isEnabled)
         {
             if (llm != null) llm.enabled = false;
@@ -375,7 +374,19 @@ public class LLMProxySettings : MonoBehaviour
 
     private bool IsInTextInputState()
     {
-        return apiKeyInput.isFocused || endpointInput.isFocused || modelInput.isFocused || portInput.isFocused;
+        // 1. First check if EventSystem exists (avoid null reference)
+        if (EventSystem.current == null)
+            return false;
+
+        // 2. Get the currently selected UI object
+        GameObject selectedObj = EventSystem.current.currentSelectedGameObject;
+        if (selectedObj == null)
+            return false;
+
+        bool isUGUIInput = selectedObj.GetComponent<InputField>() != null;
+        bool isTMPInput = selectedObj.GetComponent<TMP_InputField>() != null;
+
+        return isUGUIInput || isTMPInput;
     }
 
     public void AddMyUIToGameMenuList()
