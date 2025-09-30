@@ -1,10 +1,11 @@
 ﻿using LLMUnity;
 using Newtonsoft.Json;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
-using Debug = UnityEngine.Debug;
 
 public class LLMProxySettings : MonoBehaviour
 {
@@ -15,27 +16,28 @@ public class LLMProxySettings : MonoBehaviour
     private string fileName = "LLMProxySettings.json";
     private string FilePath => Path.Combine(Application.persistentDataPath, fileName);
 
-    // Cached references for efficient apply/save
-    private LLM llm; // 本地LLM
+    // Cached references
+    private LLM llm;
     private LLMCharacter llmCharacter;
+    private MenuActions _gameMenuActions;
+    private MenuEntry _myUIMenuEntry;
+    private bool _isMyUIAddedToMenuList = false;
+    public KeyCode toggleKey = KeyCode.J;
 
-    private MenuActions _gameMenuActions; // Game's existing MenuActions instance
-    private MenuEntry _myUIMenuEntry; // Menu entry for this UI
-    private bool _isMyUIAddedToMenuList = false; // Track if UI is in menu list
-    public KeyCode toggleKey = KeyCode.J; // 绑定到J键
+    public LLMAPIProxy proxy; // Drag in Inspector or dynamically assign
 
-    public LLMAPIProxy proxy; // Reference to the LLMAPIProxy component (在Inspector中拖拽或动态创建)
-
-    // UI引用（在Inspector拖拽，使用TMP组件）
-    public Canvas targetCanvas; // UI Canvas
+    // UI references (Drag in Inspector, use TMP components)
+    public Canvas targetCanvas;
     public Toggle enableToggle;
     public GameObject remoteConfigGroup;
-    public TMP_Dropdown providerDropdown; // 使用TMP_Dropdown
-    public TMP_InputField apiKeyInput, endpointInput, modelInput, portInput; // 使用TMP_InputField
-    public TMP_Dropdown templateDropdown; // 使用TMP_Dropdown
+    public TMP_Dropdown presetDropdown;
+    public Button addPresetButton;
+    public Button deletePresetButton;
+    public TMP_Dropdown providerDropdown;
+    public TMP_InputField apiKeyInput, endpointInput, modelInput, portInput;
+    public TMP_Dropdown templateDropdown;
     public Button saveButton, closeButton;
-
-    public TMP_Text debugText; // 用于显示调试信息
+    public TMP_Text debugText;
 
     private void Awake()
     {
@@ -43,74 +45,89 @@ public class LLMProxySettings : MonoBehaviour
         {
             Instance = this;
         }
-
     }
 
     private void Start()
     {
-        // Cache references
         CacheComponents();
-
         LoadFromDisk();
+        InitializeUI();
         ApplyAllSettings();
-
-        // Initialize menu entry
-        _myUIMenuEntry = new MenuEntry
-        {
-            menu = targetCanvas.gameObject,
-        };
-
-        // 初始化UI事件
-        enableToggle.onValueChanged.AddListener(OnEnableChanged);
-        providerDropdown.onValueChanged.AddListener(OnProviderChanged);
-        saveButton.onClick.AddListener(SaveAndApply);
-        closeButton.onClick.AddListener(ClosePanel);
-        portInput.onEndEdit.AddListener(OnPortChanged);
-
     }
 
     private void OnApplicationQuit()
     {
-        SaveToDisk(); // Auto-save on exit
+        SaveToDisk();
     }
 
     private void CacheComponents()
     {
-        llm = FindFirstObjectByType<LLM>(UnityEngine.FindObjectsInactive.Include);
+        llm = FindAnyObjectByType<LLM>(FindObjectsInactive.Include);
         if (llm == null)
         {
-            Debug.LogWarning("[LLMProxySettings] No LLM component found in the scene.");
+            Debug.LogWarning("[LLMProxySettings] No LLM component found.");
         }
-        llmCharacter = FindFirstObjectByType<LLMCharacter>(UnityEngine.FindObjectsInactive.Include);
+        llmCharacter = FindAnyObjectByType<LLMCharacter>(FindObjectsInactive.Include);
         if (llmCharacter == null)
         {
-            Debug.LogWarning(
-            "[LLMProxySettings] No LLMCharacter component found in the scene. Remote LLM may not function correctly."
-            );
+            Debug.LogWarning("[LLMProxySettings] No LLMCharacter component found.");
         }
-        _gameMenuActions = FindFirstObjectByType<MenuActions>(); // 查找游戏的MenuActions
+        _gameMenuActions = FindAnyObjectByType<MenuActions>();
+    }
+
+    private void InitializeUI()
+    {
+        // Populate dropdowns
+        providerDropdown.options = new List<TMP_Dropdown.OptionData>
+        {
+            new TMP_Dropdown.OptionData("OpenAI"),
+            new TMP_Dropdown.OptionData("Anthropic"),
+            new TMP_Dropdown.OptionData("Custom")
+        };
+
+        templateDropdown.options = new List<TMP_Dropdown.OptionData>
+        {
+            new TMP_Dropdown.OptionData("chatml"),
+            new TMP_Dropdown.OptionData("alpaca"), // Add more templates as needed
+            new TMP_Dropdown.OptionData("vicuna")
+        };
+
+        // Add listeners
+        enableToggle.onValueChanged.AddListener(OnEnableChanged);
+        providerDropdown.onValueChanged.AddListener(OnProviderChanged);
+        presetDropdown.onValueChanged.AddListener(OnPresetChanged);
+        addPresetButton.onClick.AddListener(AddPreset);
+        deletePresetButton.onClick.AddListener(DeletePreset);
+        saveButton.onClick.AddListener(SaveAndApply);
+        closeButton.onClick.AddListener(ClosePanel);
+        portInput.onEndEdit.AddListener(OnPortChanged);
+        apiKeyInput.onEndEdit.AddListener(_ => UpdateCurrentFromUI());
+        endpointInput.onEndEdit.AddListener(_ => UpdateCurrentFromUI());
+        modelInput.onEndEdit.AddListener(_ => UpdateCurrentFromUI());
+        templateDropdown.onValueChanged.AddListener(_ => UpdateCurrentFromUI());
+
+        // Initialize menu entry
+        _myUIMenuEntry = new MenuEntry { menu = targetCanvas.gameObject };
     }
 
     public void SaveToDisk()
     {
         try
         {
-            // Sync data from UI before saving
-            SyncDataFromUI();
+            UpdateCurrentFromUI();
 
             string dir = Path.GetDirectoryName(FilePath);
-            if (!Directory.Exists(dir))
-                Directory.CreateDirectory(dir);
+            if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
 
             var settings = new JsonSerializerSettings
             {
-                Formatting = Newtonsoft.Json.Formatting.Indented,
+                Formatting = Formatting.Indented,
                 ReferenceLoopHandling = ReferenceLoopHandling.Ignore
             };
 
             string json = JsonConvert.SerializeObject(data, settings);
             File.WriteAllText(FilePath, json);
-            Debug.Log("[LLMProxySettings] Saved settings to: " + FilePath);
+            Debug.Log("[LLMProxySettings] Saved to: " + FilePath);
         }
         catch (System.Exception e)
         {
@@ -125,8 +142,8 @@ public class LLMProxySettings : MonoBehaviour
             try
             {
                 string json = File.ReadAllText(FilePath);
-                data = JsonConvert.DeserializeObject<LLMProxySettingsData>(json);
-                Debug.Log("[LLMProxySettings] Loaded settings from: " + FilePath);
+                data = JsonConvert.DeserializeObject<LLMProxySettingsData>(json) ?? new LLMProxySettingsData();
+                Debug.Log("[LLMProxySettings] Loaded from: " + FilePath);
             }
             catch (System.Exception e)
             {
@@ -138,79 +155,118 @@ public class LLMProxySettings : MonoBehaviour
         {
             data = new LLMProxySettingsData();
         }
+
+        // Ensure at least one config
+        if (data.apiConfigs.Count == 0)
+        {
+            data.apiConfigs.Add(new LLMProxySettingsData.APIConfigData { name = "Default" });
+        }
     }
 
     public static void ApplyAllSettings()
     {
-        if (Instance == null)
-        {
-            Instance = FindFirstObjectByType<LLMProxySettings>();
-        }
-        var data = Instance.data;
+        if (Instance == null) Instance = FindAnyObjectByType<LLMProxySettings>();
+        var inst = Instance;
+        var d = inst.data;
 
-        // Apply to UI (for display)
-        Instance.enableToggle.isOn = data.enableRemote;
-        Instance.providerDropdown.value = (int)data.provider;
-        Instance.apiKeyInput.text = data.apiKey;
-        Instance.endpointInput.text = data.apiEndpoint;
-        Instance.modelInput.text = data.model;
-        Instance.templateDropdown.value = data.templateIndex;
-        Instance.portInput.text = data.proxyPort.ToString();
-
-        Instance.OnEnableChanged(data.enableRemote);
-        Instance.OnProviderChanged((int)data.provider);
-        Instance.OnPortChanged(data.proxyPort.ToString());
-
-        // Apply to scene
-        Instance.ApplyConfig();
+        inst.enableToggle.isOn = d.enableRemote;
+        inst.portInput.text = d.proxyPort.ToString();
+        inst.remoteConfigGroup.SetActive(d.enableRemote);
+        inst.RefreshPresetDropdown();
+        inst.LoadCurrentPresetToUI();
+        inst.OnEnableChanged(d.enableRemote);
+        inst.ApplyConfig();
     }
 
-    private void SyncDataFromUI()
+    private void RefreshPresetDropdown()
     {
-        data.enableRemote = enableToggle.isOn;
-        if (data.enableRemote)
-        {
-            data.provider = (LLMAPIProxy.APIProvider)providerDropdown.value;
-            data.apiKey = apiKeyInput.text;
-            data.apiEndpoint = endpointInput.text;
-            data.model = modelInput.text;
-            data.templateIndex = templateDropdown.value;
-            data.chatTemplate = templateDropdown.options[templateDropdown.value].text;
-            if (int.TryParse(portInput.text, out int port))
-            {
-                data.proxyPort = port;
-            }
-        }
+        presetDropdown.options = data.apiConfigs.Select(c => new TMP_Dropdown.OptionData(c.name)).ToList();
+        presetDropdown.value = data.activeConfigIndex;
+        presetDropdown.RefreshShownValue();
+    }
+
+    private void LoadCurrentPresetToUI()
+    {
+        if (data.apiConfigs.Count == 0) return;
+        data.activeConfigIndex = Mathf.Clamp(data.activeConfigIndex, 0, data.apiConfigs.Count - 1);
+        var conf = data.apiConfigs[data.activeConfigIndex];
+        providerDropdown.value = (int)conf.provider;
+        apiKeyInput.text = conf.apiKey;
+        endpointInput.text = conf.apiEndpoint;
+        modelInput.text = conf.model;
+        templateDropdown.value = conf.templateIndex;
+    }
+
+    private void UpdateCurrentFromUI()
+    {
+        if (data.apiConfigs.Count == 0 || data.activeConfigIndex >= data.apiConfigs.Count) return;
+        var conf = data.apiConfigs[data.activeConfigIndex];
+        conf.provider = (LLMAPIProxy.APIProvider)providerDropdown.value;
+        conf.apiKey = apiKeyInput.text;
+        conf.apiEndpoint = endpointInput.text;
+        conf.model = modelInput.text;
+        conf.templateIndex = templateDropdown.value;
+        conf.chatTemplate = templateDropdown.options[conf.templateIndex].text;
     }
 
     private void Update()
     {
-        HandleKeyToggleUI(); // 处理J键开关
+        HandleKeyToggleUI();
     }
 
     private void OnEnableChanged(bool isEnabled)
     {
+        data.enableRemote = isEnabled;
         remoteConfigGroup.SetActive(isEnabled);
         if (isEnabled)
         {
-            llm.enabled = false;
-            llmCharacter.remote = true;
-            llmCharacter.stream = false;
-
+            if (llm != null) llm.enabled = false;
+            if (llmCharacter != null)
+            {
+                llmCharacter.remote = true;
+                llmCharacter.stream = false;
+            }
         }
         else
         {
-            llm.enabled = true;
-            llmCharacter.remote = false;
-            llmCharacter.stream = true;
-
+            if (llm != null) llm.enabled = true;
+            if (llmCharacter != null)
+            {
+                llmCharacter.remote = false;
+                llmCharacter.stream = true;
+            }
         }
     }
 
     private void OnProviderChanged(int value)
     {
-        LLMAPIProxy.APIProvider provider = (LLMAPIProxy.APIProvider)value;
+        UpdateCurrentFromUI();
+    }
 
+    private void OnPresetChanged(int value)
+    {
+        UpdateCurrentFromUI(); // Save previous
+        data.activeConfigIndex = value;
+        LoadCurrentPresetToUI();
+    }
+
+    private void AddPreset()
+    {
+        UpdateCurrentFromUI();
+        var newConf = new LLMProxySettingsData.APIConfigData { name = $"Preset {data.apiConfigs.Count + 1}" };
+        data.apiConfigs.Add(newConf);
+        data.activeConfigIndex = data.apiConfigs.Count - 1;
+        RefreshPresetDropdown();
+        LoadCurrentPresetToUI();
+    }
+
+    private void DeletePreset()
+    {
+        if (data.apiConfigs.Count <= 1) return;
+        data.apiConfigs.RemoveAt(data.activeConfigIndex);
+        data.activeConfigIndex = Mathf.Clamp(data.activeConfigIndex, 0, data.apiConfigs.Count - 1);
+        RefreshPresetDropdown();
+        LoadCurrentPresetToUI();
     }
 
     private void OnPortChanged(string value)
@@ -218,16 +274,24 @@ public class LLMProxySettings : MonoBehaviour
         if (int.TryParse(value, out int port))
         {
             data.proxyPort = port;
-            llmCharacter.port = port;
+            if (llmCharacter != null) llmCharacter.port = port;
+            if (proxy != null && proxy.isRunning)
+            {
+                proxy.StopProxyServer();
+                proxy.proxyPort = port;
+
+                proxy.StartProxyServer();
+            }
         }
         else
         {
-            Debug.LogWarning("[LLMProxySettings] Invalid port number: " + value);
+            Debug.LogWarning("[LLMProxySettings] Invalid port: " + value);
         }
     }
 
     private void SaveAndApply()
     {
+        UpdateCurrentFromUI();
         SaveToDisk();
         ApplyConfig();
         ClosePanel();
@@ -235,25 +299,39 @@ public class LLMProxySettings : MonoBehaviour
 
     private void ApplyConfig()
     {
-
         if (data.enableRemote)
         {
-            proxy.provider = data.provider;
-            proxy.apiKey = data.apiKey;
-            proxy.apiEndpoint = data.apiEndpoint;
-            proxy.model = data.model;
-            proxy.chatTemplate = data.chatTemplate;
-            proxy.proxyPort = data.proxyPort;
-
-            // 修改场景
-            if (llm != null)
+            if (proxy == null)
             {
-                llm.enabled = false;
+                proxy = gameObject.AddComponent<LLMAPIProxy>(); // Or ensure it's in scene
             }
+
+            proxy.configs = data.apiConfigs.Select(c => new LLMProxySettings.LLMProxySettingsData.APIConfigData
+            {
+                name = c.name,
+                provider = c.provider,
+                apiKey = c.apiKey,
+                apiEndpoint = c.apiEndpoint,
+                model = c.model,
+                chatTemplate = c.chatTemplate
+            }).ToList();
+
+            proxy.currentConfigIndex = data.activeConfigIndex;
+
+            if (proxy.proxyPort != data.proxyPort)
+            {
+                if (proxy.isRunning) proxy.StopProxyServer();
+                proxy.proxyPort = data.proxyPort;
+            }
+
+            if (!proxy.isRunning) proxy.StartProxyServer();
+
+            if (llm != null) llm.enabled = false;
             if (llmCharacter != null)
             {
                 llmCharacter.remote = true;
-                llmCharacter.port = data.proxyPort; // 假设LLMCharacter有public int port
+                llmCharacter.port = data.proxyPort;
+                llmCharacter.stream = false;
             }
         }
         else
@@ -261,18 +339,15 @@ public class LLMProxySettings : MonoBehaviour
             if (proxy != null)
             {
                 proxy.StopProxyServer();
-                Destroy(proxy.gameObject);
+                Destroy(proxy);
                 proxy = null;
             }
 
-            // 恢复本地
-            if (llm != null)
-            {
-                llm.enabled = true;
-            }
+            if (llm != null) llm.enabled = true;
             if (llmCharacter != null)
             {
                 llmCharacter.remote = false;
+                llmCharacter.stream = true;
             }
         }
     }
@@ -283,27 +358,18 @@ public class LLMProxySettings : MonoBehaviour
         {
             targetCanvas.gameObject.SetActive(false);
         }
-        RemoveMyUIFromGameMenuList(); // 关闭时从菜单移除
+        RemoveMyUIFromGameMenuList();
     }
 
     private void HandleKeyToggleUI()
     {
-        if (targetCanvas == null) return;
-        if (IsInTextInputState()) return; // 防止输入时触发
+        if (targetCanvas == null || IsInTextInputState()) return;
         if (Input.GetKeyDown(toggleKey))
         {
-            GameObject targetCanvasObject = targetCanvas.gameObject;
-            bool newVisibleState = !targetCanvasObject.activeSelf;
-            targetCanvasObject.SetActive(newVisibleState);
-
-            if (newVisibleState)
-            {
-                AddMyUIToGameMenuList(); // 打开时添加到菜单
-            }
-            else
-            {
-                RemoveMyUIFromGameMenuList(); // 关闭时移除
-            }
+            bool newState = !targetCanvas.gameObject.activeSelf;
+            targetCanvas.gameObject.SetActive(newState);
+            if (newState) AddMyUIToGameMenuList();
+            else RemoveMyUIFromGameMenuList();
         }
     }
 
@@ -314,13 +380,8 @@ public class LLMProxySettings : MonoBehaviour
 
     public void AddMyUIToGameMenuList()
     {
-        if (_gameMenuActions == null || _isMyUIAddedToMenuList || _myUIMenuEntry == null)
-            return;
-
-        bool isAlreadyInList = _gameMenuActions.menuEntries.Exists(
-            entry => entry.menu == targetCanvas.gameObject
-        );
-        if (!isAlreadyInList)
+        if (_gameMenuActions == null || _isMyUIAddedToMenuList || _myUIMenuEntry == null) return;
+        if (!_gameMenuActions.menuEntries.Exists(e => e.menu == targetCanvas.gameObject))
         {
             _gameMenuActions.menuEntries.Add(_myUIMenuEntry);
             _isMyUIAddedToMenuList = true;
@@ -329,36 +390,30 @@ public class LLMProxySettings : MonoBehaviour
 
     public void RemoveMyUIFromGameMenuList()
     {
-        if (_gameMenuActions == null || !_isMyUIAddedToMenuList || _myUIMenuEntry == null)
-            return;
-
-        _gameMenuActions.menuEntries.RemoveAll(
-            entry => entry.menu == targetCanvas.gameObject
-        );
+        if (_gameMenuActions == null || !_isMyUIAddedToMenuList || _myUIMenuEntry == null) return;
+        _gameMenuActions.menuEntries.RemoveAll(e => e.menu == targetCanvas.gameObject);
         _isMyUIAddedToMenuList = false;
-    }
-
-    // Public method to trigger save on setting changes (call from other scripts if needed)
-    public static void OnSettingChanged()
-    {
-        if (Instance != null)
-        {
-            Instance.SaveToDisk();
-        }
     }
 
     [System.Serializable]
     public class LLMProxySettingsData
     {
-        public string version = "1.0"; // For future migrations
+        public string version = "1.0";
         public bool enableRemote = false;
-        public LLMAPIProxy.APIProvider provider = LLMAPIProxy.APIProvider.OpenAI;
-        public string apiKey = "";
-        public string apiEndpoint = "https://api.openai.com/v1/chat/completions";
-        public string model = "gpt-3.5-turbo";
-        public int templateIndex = 0; // Index for dropdown
-        public string chatTemplate = "chatml";
-        public bool debug = false;
+        public List<APIConfigData> apiConfigs = new List<APIConfigData>();
+        public int activeConfigIndex = 0;
         public int proxyPort = 13333;
+
+        [System.Serializable]
+        public class APIConfigData
+        {
+            public string name = "Default";
+            public LLMAPIProxy.APIProvider provider = LLMAPIProxy.APIProvider.OpenAI;
+            public string apiKey = "";
+            public string apiEndpoint = "https://api.openai.com/v1/chat/completions";
+            public string model = "gpt-3.5-turbo";
+            public int templateIndex = 0;
+            public string chatTemplate = "chatml";
+        }
     }
 }

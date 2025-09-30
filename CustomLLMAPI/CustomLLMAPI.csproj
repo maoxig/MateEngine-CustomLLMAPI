@@ -116,6 +116,7 @@
     <Compile Include="LLMAPIProxy.cs" />
     <Compile Include="MainThreadDispatcher.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
+    <Compile Include="UIDragHandler.cs" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
 </Project>

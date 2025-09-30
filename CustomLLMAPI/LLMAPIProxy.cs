@@ -9,25 +9,26 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
-using UnityEngine.Networking;
+using static LLMUnity.LLMAPIProxy;
 
 namespace LLMUnity
 {
+
+
     public class LLMAPIProxy : MonoBehaviour
     {
         [Header("Proxy Settings")]
         public int proxyPort = 13333;
-        public APIProvider provider = APIProvider.OpenAI;
+        public List<LLMProxySettings.LLMProxySettingsData.APIConfigData> configs = new List<LLMProxySettings.LLMProxySettingsData.APIConfigData>();
+        public int currentConfigIndex = 0;
 
-        [Header("API Configuration")]
-        public string apiKey = "";
-        public string apiEndpoint = "https://api.openai.com/v1/chat/completions";
-        public string model = "gpt-3.5-turbo";
-        public string chatTemplate = "chatml";
-
+        // Internal state
+        private LLMProxySettings settingsRef;
         private Socket listenerSocket;
-        private bool isRunning = false;
+        public bool isRunning = false;
         private Thread acceptThread;
+        private const int maxRetries = 3;
+        private const int maxPortFallbacks = 10;
 
         public enum APIProvider { OpenAI, Anthropic, Custom }
 
@@ -51,8 +52,6 @@ namespace LLMUnity
 
         public class DetokenizeResponse { public string text; }
 
-
-
         public class StreamDataItem { public string content; public bool stop; }
         public class StreamResult { public StreamDataItem[] data; }
         public class APIMessage { public string role; public string content; }
@@ -63,11 +62,11 @@ namespace LLMUnity
         void Awake()
         {
             MainThreadDispatcher.CreateIfNeeded();
-        }
-
-        async void Start()
-        {
-            await StartProxyServer();
+            settingsRef = FindAnyObjectByType<LLMProxySettings>();
+            if (settingsRef == null)
+            {
+                Debug.LogWarning("[LLMAPIProxy] No LLMProxySettings found in scene.");
+            }
         }
 
         public async Task StartProxyServer()
@@ -81,27 +80,57 @@ namespace LLMUnity
             try
             {
                 listenerSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                // Bind to loopback - you may change to IPAddress.Any if needed
-                listenerSocket.Bind(new IPEndPoint(IPAddress.Loopback, proxyPort));
+                int originalPort = proxyPort;
+                bool bound = false;
+                for (int i = 0; i < maxPortFallbacks; i++)
+                {
+                    try
+                    {
+                        listenerSocket.Bind(new IPEndPoint(IPAddress.Loopback, proxyPort));
+                        bound = true;
+                        break;
+                    }
+                    catch (SocketException se) when (se.SocketErrorCode == SocketError.AddressAlreadyInUse)
+                    {
+                        proxyPort++;
+                    }
+                }
+
+                if (!bound)
+                {
+                    throw new Exception($"Failed to bind after {maxPortFallbacks} attempts starting from port {originalPort}.");
+                }
+
+                if (proxyPort != originalPort)
+                {
+                    Debug.LogWarning($"[LLM Proxy] Port {originalPort} in use or conflicted. Falling back to port {proxyPort}.");
+                    MainThreadDispatcher.Instance.Enqueue(() =>
+                    {
+                        if (settingsRef != null && settingsRef.portInput != null)
+                        {
+                            settingsRef.data.proxyPort = proxyPort;
+                            settingsRef.portInput.text = proxyPort.ToString();
+                        }
+                    });
+                }
+
                 listenerSocket.Listen(50);
                 isRunning = true;
 
                 Debug.Log($"[LLM Proxy] Server started on port {proxyPort}");
 
-                // Use a dedicated thread for Accept to avoid Task.FromAsync / BeginAccept issues on Mono
                 acceptThread = new Thread(HandleRequestsThread) { IsBackground = true, Name = "LLMProxy-AcceptThread" };
                 acceptThread.Start();
             }
             catch (Exception e)
             {
-                Debug.LogError($"[LLM Proxy] Failed to start server: {e.Message}\n{e.StackTrace}");
+                Debug.LogError($"[LLM Proxy] Failed to start server: {e.Message}");
                 throw;
             }
 
             await Task.CompletedTask;
         }
 
-        // Dedicated accept thread (blocking Accept)
         private void HandleRequestsThread()
         {
             Debug.Log("[LLM Proxy] Accept thread running.");
@@ -109,9 +138,8 @@ namespace LLMUnity
             {
                 try
                 {
-                    Socket client = listenerSocket.Accept(); // blocking
+                    Socket client = listenerSocket.Accept();
                     Debug.Log($"[LLM Proxy] Accepted connection from {client.RemoteEndPoint}");
-                    // Process client on thread pool (synchronous socket IO inside)
                     ThreadPool.QueueUserWorkItem(obj => ProcessSocketRequest((Socket)obj), client);
                 }
                 catch (SocketException se)
@@ -121,20 +149,18 @@ namespace LLMUnity
                 }
                 catch (Exception e)
                 {
-                    Debug.LogError($"[LLM Proxy] Accept thread error: {e.Message}\n{e.StackTrace}");
+                    Debug.LogError($"[LLM Proxy] Accept thread error: {e.Message}");
                 }
             }
             Debug.Log("[LLM Proxy] Accept thread exiting.");
         }
 
-        // Blocking per-client processing (synchronous receive/send)
         private void ProcessSocketRequest(Socket clientSocket)
         {
             try
             {
                 using (clientSocket)
                 {
-
                     string requestString = ReadSocketRequestBlocking(clientSocket);
                     if (string.IsNullOrEmpty(requestString))
                     {
@@ -151,7 +177,6 @@ namespace LLMUnity
 
                     if (path != null && path.ToLower().Contains("completion"))
                     {
-                        // Forward to API — this will call MainThreadDispatcher for UWR; we block-wait here.
                         try
                         {
                             var task = HandleCompletion(body);
@@ -168,16 +193,22 @@ namespace LLMUnity
                     {
                         responseBody = HandleTemplate();
                     }
-                    else if (path != null && path.ToLower().Contains("template"))
-                        responseBody = HandleTemplate();
                     else if (path != null && path.ToLower().Contains("tokenize"))
+                    {
                         responseBody = HandleTokenize(body);
+                    }
                     else if (path != null && path.ToLower().Contains("detokenize"))
+                    {
                         responseBody = HandleDetokenize(body);
+                    }
                     else if (path != null && path.ToLower().Contains("slot"))
+                    {
                         responseBody = HandleSlot(body);
-                    else if (path != null && path.ToLower().Contains("props") || path != null && path.ToLower().Contains("health"))
+                    }
+                    else if (path != null && path.ToLower().Contains("props") || path.ToLower().Contains("health"))
+                    {
                         responseBody = HandleProps();
+                    }
                     else
                     {
                         statusCode = 404;
@@ -209,37 +240,39 @@ namespace LLMUnity
                     }
                     catch (Exception e)
                     {
-                        Debug.LogError($"[LLM Proxy] Send error: {e.Message}\n{e.StackTrace}");
+                        Debug.LogError($"[LLM Proxy] Send error: {e.Message}");
                     }
                 }
             }
             catch (Exception e)
             {
-                Debug.LogError($"[LLM Proxy] ProcessSocketRequestBlocking error: {e.Message}\n{e.StackTrace}");
+                Debug.LogError($"[LLM Proxy] ProcessSocketRequest error: {e.Message}");
             }
         }
 
         private string HandleProps()
         {
+            string currentModel = configs.Count > 0 ? configs[currentConfigIndex].model : "unknown";
             return JsonConvert.SerializeObject(new PropsResponse
             {
                 default_generation_settings = new GenerationSettings { n_predict = 128, temperature = 0.7f, top_p = 0.9 },
                 total_slots = 1,
-                model = model,
+                model = currentModel,
                 system_prompt = ""
             });
         }
 
         private string HandleTemplate()
         {
-            return JsonConvert.SerializeObject(new TemplateResponse { template = chatTemplate });
+            string currentTemplate = configs.Count > 0 ? configs[currentConfigIndex].chatTemplate : "chatml";
+            return JsonConvert.SerializeObject(new TemplateResponse { template = currentTemplate });
         }
 
         private async Task<string> HandleCompletion(string requestBody)
         {
             try
             {
-                string apiResponse = await ForwardToAPI(requestBody);
+                var apiResponse = await ForwardToAPI(requestBody);
                 return apiResponse;
             }
             catch (Exception e)
@@ -253,7 +286,6 @@ namespace LLMUnity
         private string HandleSlot(string body)
         {
             return JsonConvert.SerializeObject(new SlotResponse { slot = 0, in_use = false, current_task = "", user = "", system_prompt = "" });
-
         }
 
         private string HandleDetokenize(string body)
@@ -266,7 +298,6 @@ namespace LLMUnity
             return JsonConvert.SerializeObject(new TokenizeResponse { tokens = new int[0] });
         }
 
-        // Blocking read that ensures we read headers and then Content-Length bytes of body
         private string ReadSocketRequestBlocking(Socket socket)
         {
             try
@@ -276,15 +307,13 @@ namespace LLMUnity
                     byte[] buffer = new byte[4096];
                     int total = 0;
 
-                    // Read until we see header end (\r\n\r\n)
                     while (true)
                     {
-                        int read = socket.Receive(buffer, 0, buffer.Length, SocketFlags.None); // blocking
+                        int read = socket.Receive(buffer, 0, buffer.Length, SocketFlags.None);
                         if (read <= 0) break;
                         ms.Write(buffer, 0, read);
                         total += read;
 
-                        // Prevent runaway
                         if (ms.Length > 20 * 1024 * 1024)
                         {
                             Debug.LogError("[LLM Proxy] Request too large.");
@@ -295,7 +324,6 @@ namespace LLMUnity
                         int headerEnd = s.IndexOf("\r\n\r\n", StringComparison.Ordinal);
                         if (headerEnd >= 0)
                         {
-                            // Parse headers
                             string headerPart = s.Substring(0, headerEnd);
                             int contentLength = 0;
                             string[] headerLines = headerPart.Split(new[] { "\r\n" }, StringSplitOptions.None);
@@ -325,7 +353,7 @@ namespace LLMUnity
                                 need -= r;
                             }
 
-                            break; // finished reading full request
+                            break;
                         }
                     }
 
@@ -339,7 +367,7 @@ namespace LLMUnity
             }
             catch (Exception e)
             {
-                Debug.LogError($"[LLM Proxy] Read error: {e.Message}\n{e.StackTrace}");
+                Debug.LogError($"[LLM Proxy] Read error: {e.Message}");
                 return null;
             }
         }
@@ -381,44 +409,57 @@ namespace LLMUnity
             return (method, path, headers, body);
         }
 
-
         private async Task<string> ForwardToAPI(string llamaCppRequest)
         {
-            try
+            if (configs.Count == 0)
             {
-                var llmRequest = JsonConvert.DeserializeObject<Dictionary<string, object>>(llamaCppRequest ?? "{}");
-                string apiRequestBody = ConvertToAPIFormat(llmRequest);
+                throw new Exception("No API configurations available.");
+            }
 
-                // Must run UnityWebRequest on main thread
-                string responseBody = await MainThreadDispatcher.Instance.RunRequestOnMainThread(apiEndpoint, "POST", apiRequestBody, $"Bearer {apiKey}");
-
-                if (string.IsNullOrEmpty(responseBody))
+            int attempts = 0;
+            while (attempts < maxRetries)
+            {
+                try
                 {
-                    Debug.LogError($"[LLM Proxy] API returned empty response");
-                    var err = new CompletionResponse { content = "Error: Empty API response", stop = true };
-                    return JsonConvert.SerializeObject(err);
-                }
+                    var currentConfig = configs[currentConfigIndex];
+                    var llmRequest = JsonConvert.DeserializeObject<Dictionary<string, object>>(llamaCppRequest ?? "{}");
+                    string apiRequestBody = ConvertToAPIFormat(llmRequest, currentConfig);
 
-                return ConvertFromAPIFormat(responseBody, llmRequest);
+                    string authHeader = $"Bearer {currentConfig.apiKey}";
+                    string responseBody = await MainThreadDispatcher.Instance.RunRequestOnMainThread(currentConfig.apiEndpoint, "POST", apiRequestBody, authHeader);
+
+                    if (string.IsNullOrEmpty(responseBody))
+                    {
+                        throw new Exception("API returned empty response.");
+                    }
+
+                    return ConvertFromAPIFormat(responseBody, llmRequest, currentConfig);
+                }
+                catch (Exception e)
+                {
+                    attempts++;
+                    if (attempts >= maxRetries)
+                    {
+                        throw new Exception($"All retries failed after {maxRetries} attempts: {e.Message}");
+                    }
+                    currentConfigIndex = (currentConfigIndex + 1) % configs.Count;
+                    Debug.LogError($"[LLM Proxy] API request failed (attempt {attempts}/{maxRetries}): {e.Message}. Switching to next config.");
+                }
             }
-            catch (Exception e)
-            {
-                Debug.LogError($"[LLM Proxy] API call error: {e.Message}\n{e.StackTrace}");
-                var err = new CompletionResponse { content = $"Error: {e.Message}", stop = true };
-                return JsonConvert.SerializeObject(err);
-            }
+
+            throw new Exception("Unexpected end of retry loop.");
         }
 
-        private string ConvertToAPIFormat(Dictionary<string, object> llmRequest)
+        private string ConvertToAPIFormat(Dictionary<string, object> llmRequest, LLMProxySettings.LLMProxySettingsData.APIConfigData config)
         {
-            switch (provider)
+            switch (config.provider)
             {
                 case APIProvider.OpenAI:
                 case APIProvider.Custom:
                     {
                         var req = new OpenAIRequest
                         {
-                            model = model,
+                            model = config.model,
                             stream = llmRequest != null && llmRequest.ContainsKey("stream") && Convert.ToBoolean(llmRequest["stream"])
                         };
 
@@ -447,7 +488,7 @@ namespace LLMUnity
 
                 case APIProvider.Anthropic:
                     {
-                        var req = new AnthropicRequest { model = model, max_tokens = 1024 };
+                        var req = new AnthropicRequest { model = config.model, max_tokens = 1024 };
                         if (llmRequest != null && llmRequest.ContainsKey("prompt"))
                             req.messages = new[] { new APIMessage { role = "user", content = llmRequest["prompt"]?.ToString() ?? "" } };
 
@@ -465,7 +506,7 @@ namespace LLMUnity
             }
         }
 
-        private string ConvertFromAPIFormat(string apiResponse, Dictionary<string, object> originalRequest)
+        private string ConvertFromAPIFormat(string apiResponse, Dictionary<string, object> originalRequest, LLMProxySettings.LLMProxySettingsData.APIConfigData config)
         {
             try
             {
@@ -527,13 +568,13 @@ namespace LLMUnity
 
                 if (string.IsNullOrEmpty(content))
                 {
-                    Debug.LogWarning("[LLM Proxy] No content found in API response");
+                    Debug.LogWarning($"[LLM Proxy] No content found in API response");
                     Debug.LogWarning($"[LLM Proxy] Full response: {response.ToString(Formatting.None)}");
                 }
             }
             catch (Exception e)
             {
-                Debug.LogError($"[LLM Proxy] Error parsing response content: {e.Message}\n{e.StackTrace}");
+                Debug.LogError($"[LLM Proxy] Error parsing response content: {e.Message}");
             }
 
             bool isStream = originalRequest != null && originalRequest.ContainsKey("stream") && Convert.ToBoolean(originalRequest["stream"]);
@@ -548,7 +589,6 @@ namespace LLMUnity
                 return JsonConvert.SerializeObject(result);
             }
         }
-
 
         void OnDestroy()
         {
@@ -573,7 +613,7 @@ namespace LLMUnity
             {
                 if (acceptThread != null && acceptThread.IsAlive)
                 {
-                    acceptThread.Join(100); // let it exit
+                    acceptThread.Join(100);
                 }
             }
             catch { }
