@@ -1,4 +1,5 @@
-﻿using Newtonsoft.Json;
+﻿using LLMUnity;
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
@@ -11,6 +12,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
 using UnityEngine.Networking;
+using UnityEngine.UI;
 using static LLMUnity.LLMAPIProxy;
 
 namespace LLMUnity
@@ -29,6 +31,7 @@ namespace LLMUnity
         private Socket listenerSocket;
         public bool isRunning = false;
         private Thread acceptThread;
+        private const int maxRetries = 3;
         private const int maxPortFallbacks = 10;
 
         public enum APIProvider { OpenAI, Anthropic, Custom }
@@ -36,7 +39,7 @@ namespace LLMUnity
         #region DTOs
         public class TemplateResponse { public string template; }
         public class ErrorResponse { public string error; }
-        public class CompletionResponse { public string content; public bool stop; }
+
 
         public class PropsResponse
         {
@@ -53,8 +56,6 @@ namespace LLMUnity
 
         public class DetokenizeResponse { public string text; }
 
-        public class StreamDataItem { public string content; public bool stop; }
-        public class StreamResult { public StreamDataItem[] data; }
         public class APIMessage { public string role; public string content; }
         public class OpenAIRequest { public string model; public APIMessage[] messages; public double? temperature; public double? top_p; public int? max_tokens; public object stop; public bool stream; }
         public class AnthropicRequest { public string model; public APIMessage[] messages; public int max_tokens; public double? temperature; }
@@ -296,7 +297,7 @@ namespace LLMUnity
             catch (Exception e)
             {
                 Debug.LogError($"[LLM Proxy] Completion error: {e.Message}");
-                var cr = new CompletionResponse { content = $"Error: {e.Message}", stop = true };
+                var cr = new ChatResult { content = $"Error: {e.Message}", stop = true, id_slot = 0 };
                 return JsonConvert.SerializeObject(cr);
             }
         }
@@ -615,13 +616,14 @@ namespace LLMUnity
             }
         }
 
+
         private string ConvertFromAPIFormat(string apiResponse, Dictionary<string, object> originalRequest, LLMProxySettings.LLMProxySettingsData.APIConfigData config)
         {
             try
             {
                 if (string.IsNullOrEmpty(apiResponse))
                 {
-                    var err = new CompletionResponse { content = "Error: Empty response from API", stop = true };
+                    var err = new ChatResult { content = "Error: Empty response from API", stop = true ,  id_slot = 0 };
                     return JsonConvert.SerializeObject(err);
                 }
 
@@ -631,7 +633,7 @@ namespace LLMUnity
             catch (JsonException e)
             {
                 Debug.LogError($"[LLM Proxy] JSON parsing error: {e.Message}");
-                var err = new CompletionResponse { content = $"Error: Failed to parse API response - {e.Message}", stop = true };
+                var err = new ChatResult { content = $"Error: Failed to parse API response - {e.Message}", stop = true , id_slot = 0 };
                 return JsonConvert.SerializeObject(err);
             }
         }
@@ -639,6 +641,7 @@ namespace LLMUnity
         private string ConvertNormalResponse(JToken response, Dictionary<string, object> originalRequest)
         {
             string content = "";
+            bool isFinished = false;
 
             try
             {
@@ -646,10 +649,27 @@ namespace LLMUnity
                 if (choices != null && choices.Count > 0)
                 {
                     var first = choices[0];
+
+                    // 检查是否完成
+                    var finishReason = first["finish_reason"];
+                    if (finishReason != null && finishReason.Type != JTokenType.Null)
+                    {
+                        isFinished = true;
+                    }
+
                     var message = first["message"];
-                    if (message != null && message["content"] != null) content = message["content"].ToString();
-                    else if (first["text"] != null) content = first["text"].ToString();
-                    else if (first["delta"] != null && first["delta"]["content"] != null) content = first["delta"]["content"].ToString();
+                    if (message != null && message["content"] != null)
+                    {
+                        content = message["content"].ToString();
+                    }
+                    else if (first["text"] != null)
+                    {
+                        content = first["text"].ToString();
+                    }
+                    else if (first["delta"] != null && first["delta"]["content"] != null)
+                    {
+                        content = first["delta"]["content"].ToString();
+                    }
                 }
 
                 if (string.IsNullOrEmpty(content))
@@ -675,7 +695,7 @@ namespace LLMUnity
                     else if (response["output"] != null) content = response["output"].ToString();
                 }
 
-                if (string.IsNullOrEmpty(content))
+                if (string.IsNullOrEmpty(content) && !isFinished)
                 {
                     Debug.LogWarning($"[LLM Proxy] No content found in API response");
                     Debug.LogWarning($"[LLM Proxy] Full response: {response.ToString(Formatting.None)}");
@@ -687,14 +707,26 @@ namespace LLMUnity
             }
 
             bool isStream = originalRequest != null && originalRequest.ContainsKey("stream") && Convert.ToBoolean(originalRequest["stream"]);
+
             if (isStream)
             {
-                var result = new StreamResult { data = new[] { new StreamDataItem { content = content, stop = true } } };
-                return JsonConvert.SerializeObject(result);
+                var result = new ChatResult
+                {
+                    content = content,
+                    stop = isFinished || string.IsNullOrEmpty(content),
+                    id_slot = 0
+                };
+                // 返回 SSE 格式，LLMCaller 期望的格式
+                return "data: " + JsonConvert.SerializeObject(result);
             }
             else
             {
-                var result = new CompletionResponse { content = content, stop = true };
+                var result = new ChatResult
+                {
+                    content = content,
+                    stop = true,
+                    id_slot = 0
+                };
                 return JsonConvert.SerializeObject(result);
             }
         }
