@@ -439,7 +439,6 @@ namespace LLMUnity
 
             if (!isStream)
             {
-                // 原先逻辑：一次性返回
                 string responseBody = await MainThreadDispatcher.Instance.RunRequestOnMainThread(
                     currentConfig.apiEndpoint, "POST", apiRequestBody, authHeader
                 );
@@ -449,8 +448,6 @@ namespace LLMUnity
             {
                 var tcs = new TaskCompletionSource<string>();
 
-                // Run in main-thread context because earlier code used MainThreadDispatcher for Unity main-thread work.
-                // We still do actual socket IO here (not UnityWebRequest).
                 MainThreadDispatcher.Instance.Enqueue(async () =>
                 {
                     try
@@ -461,7 +458,6 @@ namespace LLMUnity
                         string path = uri.PathAndQuery;
                         bool useSsl = uri.Scheme == "https";
 
-                        // send initial response header to original client (we will use chunked encoding)
                         if (clientSocket != null && clientSocket.Connected)
                         {
                             string initialHeader = "HTTP/1.1 200 OK\r\n" +
@@ -482,6 +478,11 @@ namespace LLMUnity
                         }
 
                         bool finished = false;
+
+                        // 优化：预分配缓冲区，避免重复创建
+                        var asciiEncoding = Encoding.ASCII;
+                        var utf8Encoding = Encoding.UTF8;
+
                         var handler = new StreamingDownloadHandler((providerChunkJson) =>
                         {
                             try
@@ -490,12 +491,11 @@ namespace LLMUnity
 
                                 if (providerChunkJson == "[DONE]")
                                 {
-                                    // send final zero-chunk to client
                                     if (clientSocket != null && clientSocket.Connected)
                                     {
                                         try
                                         {
-                                            clientSocket.Send(Encoding.ASCII.GetBytes("0\r\n\r\n"));
+                                            clientSocket.Send(asciiEncoding.GetBytes("0\r\n\r\n"));
                                         }
                                         catch (Exception e)
                                         {
@@ -507,25 +507,28 @@ namespace LLMUnity
                                     return;
                                 }
 
-                                string converted = ConvertFromAPIFormat(providerChunkJson, llmRequest, currentConfig);
-                                if (string.IsNullOrEmpty(converted)) return;
+                                // 优化：直接处理 JSON，避免完整的序列化/反序列化循环
+                                string convertedContent = ExtractContentFromStreamChunk(providerChunkJson);
+                                if (string.IsNullOrEmpty(convertedContent)) return;
 
-                                byte[] payload = Encoding.UTF8.GetBytes(converted);
-                                string sizeHex = payload.Length.ToString("x");
-                                var prefix = Encoding.ASCII.GetBytes(sizeHex + "\r\n");
-                                var suffix = Encoding.ASCII.GetBytes("\r\n");
+                                // 构造最终的 SSE 格式响应（只序列化一次）
+                                string sseData = $"data: {{\"content\":\"{EscapeJsonString(convertedContent)}\",\"stop\":false,\"id_slot\":0}}\r\n\r\n";
+                                byte[] payload = utf8Encoding.GetBytes(sseData);
+
                                 if (clientSocket != null && clientSocket.Connected)
                                 {
                                     try
                                     {
-                                        clientSocket.Send(prefix);
+                                        // 直接发送完整的 SSE 格式数据，不使用 chunked encoding 的 size prefix
+                                        // 因为我们已经在 HTTP header 中声明了 Transfer-Encoding: chunked
+                                        string sizeHex = payload.Length.ToString("x");
+                                        clientSocket.Send(asciiEncoding.GetBytes(sizeHex + "\r\n"));
                                         clientSocket.Send(payload);
-                                        clientSocket.Send(suffix);
+                                        clientSocket.Send(asciiEncoding.GetBytes("\r\n"));
                                     }
                                     catch (SocketException se)
                                     {
                                         Debug.LogError($"[LLM Proxy] Send error while streaming to client: {se.Message}");
-                                        // If sending fails (client disconnected), mark finished to avoid hanging
                                         finished = true;
                                         tcs.TrySetResult("[CLIENT_DISCONNECTED]");
                                     }
@@ -537,13 +540,11 @@ namespace LLMUnity
                             }
                         });
 
-                        // Perform request to provider (authHeader passed)
                         await handler.SendRequestAsync(host, port, path, apiRequestBody, useSsl, authHeader);
 
-                        // If provider finished without an explicit [DONE], send final zero chunk and resolve.
                         if (clientSocket != null && clientSocket.Connected)
                         {
-                            try { clientSocket.Send(Encoding.ASCII.GetBytes("0\r\n\r\n")); }
+                            try { clientSocket.Send(asciiEncoding.GetBytes("0\r\n\r\n")); }
                             catch { }
                         }
                         tcs.TrySetResult("[DONE]");
@@ -558,8 +559,73 @@ namespace LLMUnity
                 return await tcs.Task;
             }
         }
+        private string ExtractContentFromStreamChunk(string providerChunkJson)
+        {
+            try
+            {
+                JToken responseToken = JToken.Parse(providerChunkJson);
 
+                // 直接提取 content，不构造完整对象
+                var choices = responseToken["choices"] as JArray;
+                if (choices != null && choices.Count > 0)
+                {
+                    var first = choices[0];
 
+                    // 流式响应通常在 delta.content 中
+                    var delta = first["delta"];
+                    if (delta != null && delta["content"] != null)
+                    {
+                        return delta["content"].ToString();
+                    }
+
+                    // 备用路径
+                    var message = first["message"];
+                    if (message != null && message["content"] != null)
+                    {
+                        return message["content"].ToString();
+                    }
+
+                    if (first["text"] != null)
+                    {
+                        return first["text"].ToString();
+                    }
+                }
+
+                // Anthropic 格式
+                var contentToken = responseToken["content"];
+                if (contentToken != null)
+                {
+                    if (contentToken is JArray arr && arr.Count > 0)
+                    {
+                        var first = arr[0];
+                        if (first["text"] != null) return first["text"].ToString();
+                    }
+                    else if (contentToken.Type == JTokenType.String)
+                    {
+                        return contentToken.ToString();
+                    }
+                }
+
+                return "";
+            }
+            catch
+            {
+                return "";
+            }
+        }
+
+        // 新增：快速 JSON 字符串转义
+        private string EscapeJsonString(string str)
+        {
+            if (string.IsNullOrEmpty(str)) return str;
+
+            // 只处理必要的转义字符
+            return str.Replace("\\", "\\\\")
+                      .Replace("\"", "\\\"")
+                      .Replace("\n", "\\n")
+                      .Replace("\r", "\\r")
+                      .Replace("\t", "\\t");
+        }
         private string ConvertToAPIFormat(Dictionary<string, object> llmRequest, LLMProxySettings.LLMProxySettingsData.APIConfigData config)
         {
             switch (config.provider)
@@ -650,7 +716,6 @@ namespace LLMUnity
                 {
                     var first = choices[0];
 
-                    // 检查是否完成
                     var finishReason = first["finish_reason"];
                     if (finishReason != null && finishReason.Type != JTokenType.Null)
                     {
@@ -694,12 +759,6 @@ namespace LLMUnity
                     else if (response["text"] != null) content = response["text"].ToString();
                     else if (response["output"] != null) content = response["output"].ToString();
                 }
-
-                if (string.IsNullOrEmpty(content) && !isFinished)
-                {
-                    Debug.LogWarning($"[LLM Proxy] No content found in API response");
-                    Debug.LogWarning($"[LLM Proxy] Full response: {response.ToString(Formatting.None)}");
-                }
             }
             catch (Exception e)
             {
@@ -710,20 +769,26 @@ namespace LLMUnity
 
             if (isStream)
             {
+                // 流式响应：只有在有内容或结束时才返回
+                if (string.IsNullOrEmpty(content) && !isFinished)
+                {
+                    return ""; // 返回空字符串，让调用方忽略这个 chunk
+                }
+
                 var result = new ChatResult
                 {
-                    content = content,
-                    stop = isFinished || string.IsNullOrEmpty(content),
+                    content = content ?? "",
+                    stop = isFinished,
                     id_slot = 0
                 };
-                // 返回 SSE 格式，LLMCaller 期望的格式
+                // 返回 SSE 格式，但不包含换行符（在外层添加）
                 return "data: " + JsonConvert.SerializeObject(result);
             }
             else
             {
                 var result = new ChatResult
                 {
-                    content = content,
+                    content = content ?? "",
                     stop = true,
                     id_slot = 0
                 };

@@ -302,13 +302,20 @@ public class LLMProxySettings : MonoBehaviour
                 proxy.StopProxyServer();
                 proxy.proxyPort = port;
 
-                proxy.StartProxyServer();
+                // 修复 CS4014：使用 async void 并等待 StartProxyServer
+                StartProxyServerAsync();
             }
         }
         else
         {
             Debug.LogWarning("[LLMProxySettings] Invalid port: " + value);
         }
+    }
+
+    // 新增异步方法以等待 StartProxyServer
+    private async void StartProxyServerAsync()
+    {
+        await proxy.StartProxyServer();
     }
 
     private void SaveAndApply()
@@ -319,7 +326,7 @@ public class LLMProxySettings : MonoBehaviour
         ClosePanel();
     }
 
-    private void ApplyConfig()
+    private async void ApplyConfig()
     {
         proxy.configs = data.apiConfigs.Select(c => new LLMProxySettings.LLMProxySettingsData.APIConfigData
         {
@@ -338,11 +345,9 @@ public class LLMProxySettings : MonoBehaviour
             proxy.proxyPort = data.proxyPort;
         }
 
-
         if (data.enableRemote)
         {
-
-            if (!proxy.isRunning) proxy.StartProxyServer();
+            if (!proxy.isRunning) await proxy.StartProxyServer();
             if (llm != null) llm.enabled = false;
             if (llmCharacter != null)
             {
