@@ -242,7 +242,6 @@ public class LLMProxySettings : MonoBehaviour
             if (llmCharacter != null)
             {
                 llmCharacter.remote = true;
-                llmCharacter.stream = false;
             }
         }
         else
@@ -251,7 +250,6 @@ public class LLMProxySettings : MonoBehaviour
             if (llmCharacter != null)
             {
                 llmCharacter.remote = false;
-                llmCharacter.stream = true;
             }
         }
     }
@@ -350,7 +348,6 @@ public class LLMProxySettings : MonoBehaviour
             {
                 llmCharacter.remote = true;
                 llmCharacter.port = data.proxyPort;
-                llmCharacter.stream = false;
             }
         }
         else
@@ -361,7 +358,6 @@ public class LLMProxySettings : MonoBehaviour
             if (llmCharacter != null)
             {
                 llmCharacter.remote = false;
-                llmCharacter.stream = true;
             }
         }
     }

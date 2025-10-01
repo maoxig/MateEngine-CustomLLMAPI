@@ -4,11 +4,13 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
+using UnityEngine.Networking;
 using static LLMUnity.LLMAPIProxy;
 
 namespace LLMUnity
@@ -27,7 +29,6 @@ namespace LLMUnity
         private Socket listenerSocket;
         public bool isRunning = false;
         private Thread acceptThread;
-        private const int maxRetries = 3;
         private const int maxPortFallbacks = 10;
 
         public enum APIProvider { OpenAI, Anthropic, Custom }
@@ -174,13 +175,30 @@ namespace LLMUnity
 
                     string responseBody;
                     int statusCode = 200;
-
+                    bool requestIsStream = false;
+                    try
+                    {
+                        var parsedReq = JsonConvert.DeserializeObject<Dictionary<string, object>>(body ?? "{}");
+                        requestIsStream = parsedReq != null && parsedReq.ContainsKey("stream") && Convert.ToBoolean(parsedReq["stream"]);
+                    }
+                    catch { /* ignore parse errors */ }
                     if (path != null && path.ToLower().Contains("completion"))
                     {
                         try
                         {
-                            var task = HandleCompletion(body);
-                            responseBody = task.GetAwaiter().GetResult();
+                            var task = HandleCompletion(body, clientSocket);
+                            string handlerResult = task.GetAwaiter().GetResult();
+
+                            if (requestIsStream)
+                            {
+                                // 流式已经在 HandleCompletion/ForwardToAPI 中被处理（header + chunked body）
+                                // 不要再走后面的打包发送逻辑，直接返回
+                                return;
+                            }
+                            else
+                            {
+                                responseBody = handlerResult;
+                            }
                         }
                         catch (Exception e)
                         {
@@ -268,12 +286,12 @@ namespace LLMUnity
             return JsonConvert.SerializeObject(new TemplateResponse { template = currentTemplate });
         }
 
-        private async Task<string> HandleCompletion(string requestBody)
+        private async Task<string> HandleCompletion(string requestBody, Socket clientSocket = null)
         {
             try
             {
-                var apiResponse = await ForwardToAPI(requestBody);
-                return apiResponse;
+                var apiResponse = await ForwardToAPI(requestBody, clientSocket);
+                return apiResponse; // 非流式返回完整，流式时可能为空
             }
             catch (Exception e)
             {
@@ -409,46 +427,137 @@ namespace LLMUnity
             return (method, path, headers, body);
         }
 
-        private async Task<string> ForwardToAPI(string llamaCppRequest)
+        private async Task<string> ForwardToAPI(string llamaCppRequest, Socket clientSocket = null)
         {
-            if (configs.Count == 0)
+            var currentConfig = configs[currentConfigIndex];
+            var llmRequest = JsonConvert.DeserializeObject<Dictionary<string, object>>(llamaCppRequest ?? "{}");
+            bool isStream = llmRequest.ContainsKey("stream") && Convert.ToBoolean(llmRequest["stream"]);
+
+            string apiRequestBody = ConvertToAPIFormat(llmRequest, currentConfig);
+            string authHeader = $"Bearer {currentConfig.apiKey}";
+
+            if (!isStream)
             {
-                throw new Exception("No API configurations available.");
+                // 原先逻辑：一次性返回
+                string responseBody = await MainThreadDispatcher.Instance.RunRequestOnMainThread(
+                    currentConfig.apiEndpoint, "POST", apiRequestBody, authHeader
+                );
+                return ConvertFromAPIFormat(responseBody, llmRequest, currentConfig);
             }
-
-            int attempts = 0;
-            while (attempts < maxRetries)
+            else
             {
-                try
+                var tcs = new TaskCompletionSource<string>();
+
+                // Run in main-thread context because earlier code used MainThreadDispatcher for Unity main-thread work.
+                // We still do actual socket IO here (not UnityWebRequest).
+                MainThreadDispatcher.Instance.Enqueue(async () =>
                 {
-                    var currentConfig = configs[currentConfigIndex];
-                    var llmRequest = JsonConvert.DeserializeObject<Dictionary<string, object>>(llamaCppRequest ?? "{}");
-                    string apiRequestBody = ConvertToAPIFormat(llmRequest, currentConfig);
-
-                    string authHeader = $"Bearer {currentConfig.apiKey}";
-                    string responseBody = await MainThreadDispatcher.Instance.RunRequestOnMainThread(currentConfig.apiEndpoint, "POST", apiRequestBody, authHeader);
-
-                    if (string.IsNullOrEmpty(responseBody))
+                    try
                     {
-                        throw new Exception("API returned empty response.");
-                    }
+                        Uri uri = new Uri(currentConfig.apiEndpoint);
+                        string host = uri.Host;
+                        int port = uri.Port == -1 ? (uri.Scheme == "https" ? 443 : 80) : uri.Port;
+                        string path = uri.PathAndQuery;
+                        bool useSsl = uri.Scheme == "https";
 
-                    return ConvertFromAPIFormat(responseBody, llmRequest, currentConfig);
-                }
-                catch (Exception e)
-                {
-                    attempts++;
-                    if (attempts >= maxRetries)
-                    {
-                        throw new Exception($"All retries failed after {maxRetries} attempts: {e.Message}");
+                        // send initial response header to original client (we will use chunked encoding)
+                        if (clientSocket != null && clientSocket.Connected)
+                        {
+                            string initialHeader = "HTTP/1.1 200 OK\r\n" +
+                                                   "Content-Type: application/json\r\n" +
+                                                   "Transfer-Encoding: chunked\r\n" +
+                                                   "Connection: close\r\n\r\n";
+                            var headerBytes = Encoding.UTF8.GetBytes(initialHeader);
+                            try
+                            {
+                                clientSocket.Send(headerBytes);
+                            }
+                            catch (Exception se)
+                            {
+                                Debug.LogError($"[LLM Proxy] Failed to send initial header to client: {se.Message}");
+                                tcs.SetResult(JsonConvert.SerializeObject(new ErrorResponse { error = se.Message }));
+                                return;
+                            }
+                        }
+
+                        bool finished = false;
+                        var handler = new StreamingDownloadHandler((providerChunkJson) =>
+                        {
+                            try
+                            {
+                                if (finished) return;
+
+                                if (providerChunkJson == "[DONE]")
+                                {
+                                    // send final zero-chunk to client
+                                    if (clientSocket != null && clientSocket.Connected)
+                                    {
+                                        try
+                                        {
+                                            clientSocket.Send(Encoding.ASCII.GetBytes("0\r\n\r\n"));
+                                        }
+                                        catch (Exception e)
+                                        {
+                                            Debug.LogError($"[LLM Proxy] Error sending zero-chunk: {e.Message}");
+                                        }
+                                    }
+                                    finished = true;
+                                    tcs.TrySetResult("[DONE]");
+                                    return;
+                                }
+
+                                string converted = ConvertFromAPIFormat(providerChunkJson, llmRequest, currentConfig);
+                                if (string.IsNullOrEmpty(converted)) return;
+
+                                byte[] payload = Encoding.UTF8.GetBytes(converted);
+                                string sizeHex = payload.Length.ToString("x");
+                                var prefix = Encoding.ASCII.GetBytes(sizeHex + "\r\n");
+                                var suffix = Encoding.ASCII.GetBytes("\r\n");
+                                if (clientSocket != null && clientSocket.Connected)
+                                {
+                                    try
+                                    {
+                                        clientSocket.Send(prefix);
+                                        clientSocket.Send(payload);
+                                        clientSocket.Send(suffix);
+                                    }
+                                    catch (SocketException se)
+                                    {
+                                        Debug.LogError($"[LLM Proxy] Send error while streaming to client: {se.Message}");
+                                        // If sending fails (client disconnected), mark finished to avoid hanging
+                                        finished = true;
+                                        tcs.TrySetResult("[CLIENT_DISCONNECTED]");
+                                    }
+                                }
+                            }
+                            catch (Exception e)
+                            {
+                                Debug.LogError($"[LLM Proxy] Error processing provider chunk: {e.Message}");
+                            }
+                        });
+
+                        // Perform request to provider (authHeader passed)
+                        await handler.SendRequestAsync(host, port, path, apiRequestBody, useSsl, authHeader);
+
+                        // If provider finished without an explicit [DONE], send final zero chunk and resolve.
+                        if (clientSocket != null && clientSocket.Connected)
+                        {
+                            try { clientSocket.Send(Encoding.ASCII.GetBytes("0\r\n\r\n")); }
+                            catch { }
+                        }
+                        tcs.TrySetResult("[DONE]");
                     }
-                    currentConfigIndex = (currentConfigIndex + 1) % configs.Count;
-                    Debug.LogError($"[LLM Proxy] API request failed (attempt {attempts}/{maxRetries}): {e.Message}. Switching to next config.");
-                }
+                    catch (Exception e)
+                    {
+                        Debug.LogError($"[LLM Proxy] Streaming exception: {e.Message}");
+                        tcs.TrySetResult(JsonConvert.SerializeObject(new ErrorResponse { error = e.Message }));
+                    }
+                });
+
+                return await tcs.Task;
             }
-
-            throw new Exception("Unexpected end of retry loop.");
         }
+
 
         private string ConvertToAPIFormat(Dictionary<string, object> llmRequest, LLMProxySettings.LLMProxySettingsData.APIConfigData config)
         {
@@ -589,7 +698,239 @@ namespace LLMUnity
                 return JsonConvert.SerializeObject(result);
             }
         }
+        public class StreamingDownloadHandler
+        {
+            private readonly Action<string> _onData;
+            private const int ReadBufferSize = 8192;
 
+            public StreamingDownloadHandler(Action<string> onData)
+            {
+                _onData = onData;
+            }
+
+            // host: e.g. api.openai.com
+            // port: 443 for https
+            // path: "/v1/chat/completions?..."
+            // body: request body JSON (UTF8)
+            // useSsl: true for https
+            // authHeader: full value for Authorization header (e.g. "Bearer xxx")
+            public async Task SendRequestAsync(string host, int port, string path, string body = null, bool useSsl = false, string authHeader = null)
+            {
+                using (var client = new TcpClient())
+                {
+                    await client.ConnectAsync(host, port);
+                    Stream netStream = client.GetStream();
+
+                    SslStream ssl = null;
+                    if (useSsl)
+                    {
+                        ssl = new SslStream(netStream, false, (sender, cert, chain, errors) => true);
+                        await ssl.AuthenticateAsClientAsync(host, null, System.Security.Authentication.SslProtocols.None, false);
+                        netStream = ssl;
+                    }
+
+                    // --- build request header and body bytes (use UTF8 consistently) ---
+                    byte[] bodyBytes = body == null ? Array.Empty<byte>() : Encoding.UTF8.GetBytes(body);
+                    string headerStr =
+                        $"POST {path} HTTP/1.1\r\n" +
+                        $"Host: {host}\r\n" +
+                        (string.IsNullOrEmpty(authHeader) ? "" : $"Authorization: {authHeader}\r\n") +
+                        "Content-Type: application/json\r\n" +
+                        "Connection: keep-alive\r\n" +
+                        $"Content-Length: {bodyBytes.Length}\r\n" +
+                        "\r\n";
+                    byte[] headerBytes = Encoding.UTF8.GetBytes(headerStr);
+
+                    // write header + body as raw bytes
+                    await netStream.WriteAsync(headerBytes, 0, headerBytes.Length);
+                    if (bodyBytes.Length > 0)
+                        await netStream.WriteAsync(bodyBytes, 0, bodyBytes.Length);
+                    // do NOT call Flush() or FlushAsync() here — WriteAsync is sufficient for NetworkStream/SslStream
+
+                    // --- read response headers (read until \r\n\r\n) ---
+                    byte[] headerTerm = Encoding.ASCII.GetBytes("\r\n\r\n");
+                    byte[] temp = new byte[1];
+                    var hdrMs = new MemoryStream();
+                    while (true)
+                    {
+                        int r = await netStream.ReadAsync(temp, 0, 1);
+                        if (r <= 0) throw new IOException("Unexpected EOF while reading response header");
+                        hdrMs.WriteByte(temp[0]);
+                        if (hdrMs.Length >= headerTerm.Length)
+                        {
+                            var arr = hdrMs.GetBuffer();
+                            bool match = true;
+                            for (int i = 0; i < headerTerm.Length; i++)
+                            {
+                                if (arr[hdrMs.Length - headerTerm.Length + i] != headerTerm[i])
+                                {
+                                    match = false;
+                                    break;
+                                }
+                            }
+                            if (match) break;
+                        }
+                        if (hdrMs.Length > 256 * 1024) throw new IOException("Response header too large");
+                    }
+
+                    var hdrBytes = hdrMs.ToArray();
+                    string hdrText = Encoding.UTF8.GetString(hdrBytes);
+                    var headerLines = hdrText.Split(new[] { "\r\n" }, StringSplitOptions.RemoveEmptyEntries);
+                    var headerDict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                    for (int i = 1; i < headerLines.Length; i++)
+                    {
+                        var idx = headerLines[i].IndexOf(':');
+                        if (idx > 0)
+                        {
+                            var key = headerLines[i].Substring(0, idx).Trim();
+                            var val = headerLines[i].Substring(idx + 1).Trim();
+                            headerDict[key] = val;
+                        }
+                    }
+
+                    bool isChunked = false;
+                    if (headerDict.TryGetValue("Transfer-Encoding", out var te) && te != null && te.ToLower().Contains("chunked"))
+                        isChunked = true;
+
+                    void processChunkString(string chunkStr)
+                    {
+                        var segments = chunkStr.Split(new[] { "\r\n\r\n", "\n\n" }, StringSplitOptions.RemoveEmptyEntries);
+                        foreach (var seg in segments)
+                        {
+                            var lines = seg.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+                            bool hadDataLine = false;
+                            foreach (var l in lines)
+                            {
+                                var trimmed = l.Trim();
+                                if (trimmed.StartsWith("data:"))
+                                {
+                                    string jsonPart = trimmed.Substring(5).Trim();
+                                    if (jsonPart == "[DONE]")
+                                    {
+                                        _onData?.Invoke("[DONE]");
+                                    }
+                                    else
+                                    {
+                                        _onData?.Invoke(jsonPart);
+                                    }
+                                    hadDataLine = true;
+                                }
+                            }
+                            if (!hadDataLine)
+                            {
+                                _onData?.Invoke(seg);
+                            }
+                        }
+                    }
+
+                    if (isChunked)
+                    {
+                        while (true)
+                        {
+                            // read size line
+                            StringBuilder sizeSb = new StringBuilder();
+                            while (true)
+                            {
+                                int r = await netStream.ReadAsync(temp, 0, 1);
+                                if (r <= 0) throw new IOException("Unexpected EOF while reading chunk size");
+                                sizeSb.Append((char)temp[0]);
+                                if (sizeSb.Length >= 2 && sizeSb[sizeSb.Length - 2] == '\r' && sizeSb[sizeSb.Length - 1] == '\n')
+                                    break;
+                            }
+                            string sizeLine = sizeSb.ToString().Trim();
+                            int semi = sizeLine.IndexOf(';');
+                            if (semi >= 0) sizeLine = sizeLine.Substring(0, semi);
+                            int chunkSize = 0;
+                            try { chunkSize = Convert.ToInt32(sizeLine.Trim(), 16); }
+                            catch { chunkSize = 0; }
+                            if (chunkSize == 0)
+                            {
+                                // consume trailers until CRLFCRLF
+                                var trailerTerm = Encoding.ASCII.GetBytes("\r\n\r\n");
+                                var acc = new MemoryStream();
+                                byte[] one = new byte[1];
+                                while (true)
+                                {
+                                    int r = await netStream.ReadAsync(one, 0, 1);
+                                    if (r <= 0) break;
+                                    acc.WriteByte(one[0]);
+                                    if (acc.Length >= trailerTerm.Length)
+                                    {
+                                        var arr = acc.GetBuffer();
+                                        bool match = true;
+                                        for (int i = 0; i < trailerTerm.Length; i++)
+                                        {
+                                            if (arr[acc.Length - trailerTerm.Length + i] != trailerTerm[i])
+                                            {
+                                                match = false;
+                                                break;
+                                            }
+                                        }
+                                        if (match) break;
+                                    }
+                                    if (acc.Length > 64 * 1024) break;
+                                }
+                                break;
+                            }
+
+                            var chunkBuf = new byte[chunkSize];
+                            int received = 0;
+                            while (received < chunkSize)
+                            {
+                                int r = await netStream.ReadAsync(chunkBuf, received, chunkSize - received);
+                                if (r <= 0) throw new IOException("Unexpected EOF while reading chunk data");
+                                received += r;
+                            }
+                            // consume trailing CRLF after chunk data
+                            await ReadExactAsync(netStream, new byte[2]);
+
+                            string chunkText = Encoding.UTF8.GetString(chunkBuf, 0, received);
+                            processChunkString(chunkText);
+                        }
+                    }
+                    else if (headerDict.TryGetValue("Content-Length", out var clv) && int.TryParse(clv, out int contentLen))
+                    {
+                        var buf = new byte[contentLen];
+                        int got = 0;
+                        while (got < contentLen)
+                        {
+                            int r = await netStream.ReadAsync(buf, got, contentLen - got);
+                            if (r <= 0) break;
+                            got += r;
+                        }
+                        if (got > 0)
+                        {
+                            string full = Encoding.UTF8.GetString(buf, 0, got);
+                            processChunkString(full);
+                        }
+                    }
+                    else
+                    {
+                        var tmpBuf = new byte[ReadBufferSize];
+                        int rr;
+                        while ((rr = await netStream.ReadAsync(tmpBuf, 0, tmpBuf.Length)) > 0)
+                        {
+                            string part = Encoding.UTF8.GetString(tmpBuf, 0, rr);
+                            processChunkString(part);
+                        }
+                    }
+                }
+            }
+
+            // helper to consume a fixed number of bytes (we don't return the bytes here)
+            private static async Task ReadExactAsync(Stream s, byte[] dummy)
+            {
+                int desired = dummy.Length;
+                int got = 0;
+                var tmp = new byte[desired];
+                while (got < desired)
+                {
+                    int r = await s.ReadAsync(tmp, got, desired - got);
+                    if (r <= 0) break;
+                    got += r;
+                }
+            }
+        }
         void OnDestroy()
         {
             StopProxyServer();
@@ -621,4 +962,6 @@ namespace LLMUnity
             Debug.Log("[LLM Proxy] Server stopped");
         }
     }
+
+
 }
