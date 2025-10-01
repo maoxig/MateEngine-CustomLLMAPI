@@ -41,6 +41,8 @@ public class LLMProxySettings : MonoBehaviour
     public Toggle enableHidePanelOnStartToggle;
     public TMP_Text debugText;
 
+
+    private bool _isInitializing = false;
     private void Awake()
     {
         if (Instance == null)
@@ -54,7 +56,9 @@ public class LLMProxySettings : MonoBehaviour
         CacheComponents();
         LoadFromDisk();
         InitializeUI();
+        _isInitializing = true;
         ApplyAllSettings();
+        _isInitializing = false;
         if (data.hidePanelOnStart && targetCanvas != null)
         {
             targetCanvas.gameObject.SetActive(false);
@@ -115,7 +119,10 @@ public class LLMProxySettings : MonoBehaviour
         apiKeyInput.onEndEdit.AddListener(_ => UpdateCurrentFromUI());
         endpointInput.onEndEdit.AddListener(_ => UpdateCurrentFromUI());
         modelInput.onEndEdit.AddListener(_ => UpdateCurrentFromUI());
-        templateDropdown.onValueChanged.AddListener(_ => UpdateCurrentFromUI());
+        templateDropdown.onValueChanged.AddListener(value => {
+            if (_isInitializing) return;
+            UpdateCurrentFromUI();
+        });
 
         // Initialize menu entry
         _myUIMenuEntry = new MenuEntry { menu = targetCanvas.gameObject };
@@ -227,6 +234,7 @@ public class LLMProxySettings : MonoBehaviour
 
     private void OnEnableChanged(bool isEnabled)
     {
+        if (_isInitializing) return;
         data.enableRemote = isEnabled;
         if (isEnabled)
         {
@@ -254,11 +262,13 @@ public class LLMProxySettings : MonoBehaviour
 
     private void OnProviderChanged(int value)
     {
+        if (_isInitializing) return;
         UpdateCurrentFromUI();
     }
 
     private void OnPresetChanged(int value)
     {
+        if (_isInitializing) return;
         UpdateCurrentFromUI(); // Save previous
         data.activeConfigIndex = value;
         LoadCurrentPresetToUI();
@@ -313,33 +323,28 @@ public class LLMProxySettings : MonoBehaviour
 
     private void ApplyConfig()
     {
+        proxy.configs = data.apiConfigs.Select(c => new LLMProxySettings.LLMProxySettingsData.APIConfigData
+        {
+            name = c.name,
+            provider = c.provider,
+            apiKey = c.apiKey,
+            apiEndpoint = c.apiEndpoint,
+            model = c.model,
+            chatTemplate = c.chatTemplate
+        }).ToList();
+
+        proxy.currentConfigIndex = data.activeConfigIndex;
+        if (proxy.proxyPort != data.proxyPort)
+        {
+            if (proxy.isRunning) proxy.StopProxyServer();
+            proxy.proxyPort = data.proxyPort;
+        }
+
+
         if (data.enableRemote)
         {
-            if (proxy == null)
-            {
-                proxy = gameObject.AddComponent<LLMAPIProxy>(); // Or ensure it's in scene
-            }
-
-            proxy.configs = data.apiConfigs.Select(c => new LLMProxySettings.LLMProxySettingsData.APIConfigData
-            {
-                name = c.name,
-                provider = c.provider,
-                apiKey = c.apiKey,
-                apiEndpoint = c.apiEndpoint,
-                model = c.model,
-                chatTemplate = c.chatTemplate
-            }).ToList();
-
-            proxy.currentConfigIndex = data.activeConfigIndex;
-
-            if (proxy.proxyPort != data.proxyPort)
-            {
-                if (proxy.isRunning) proxy.StopProxyServer();
-                proxy.proxyPort = data.proxyPort;
-            }
 
             if (!proxy.isRunning) proxy.StartProxyServer();
-
             if (llm != null) llm.enabled = false;
             if (llmCharacter != null)
             {
@@ -350,12 +355,7 @@ public class LLMProxySettings : MonoBehaviour
         }
         else
         {
-            if (proxy != null)
-            {
-                proxy.StopProxyServer();
-                Destroy(proxy);
-                proxy = null;
-            }
+            proxy?.StopProxyServer();
 
             if (llm != null) llm.enabled = true;
             if (llmCharacter != null)
