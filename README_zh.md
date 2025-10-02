@@ -1,4 +1,6 @@
-# MateEngine Custom LLM API Mod
+# [MateEngine](https://github.com/shinyflvre/Mate-Engine) - Custom LLM API 
+
+**其他语言版本: [English](README.md), [中文](README_zh.md)**
 
 ## 简介
 
@@ -14,7 +16,6 @@
 - 支持任意符合 OpenAI Chat Completions API 规范的 LLM 服务，也能支持一些其他的符合规范的 LLM 服务
 - 完全兼容 MateEngine 原有机制（角色记忆、Prompt、聊天记录等），因为它仅仅是转发请求到远程LLM接口
 - 可保存多套 LLM API 配置，支持一键切换及故障自动回退
-- UI 上实时显示错误提示，便于排查问题
 - 设置选项保存在 `C:\Users\{你的用户名}\AppData\LocalLow\Shinymoon\MateEngineX\LLMProxySettings.json`，可手动编辑
 
 ## 安装方法
@@ -25,13 +26,12 @@
 ## 使用指南
 
 1. 按 `J` 键打开/关闭配置面板，配置完成后点击保存以启用。
-2. 填写 API Endpoint（如 `https://api.openai.com/v1/chat/completions` 或 `https://api.deepseek.com/v1/chat/completions`），请参考对应相关的 API 文档，确保路径正确
+2. 填写 API Endpoint（如 `https://api.openai.com/v1/chat/completions` 或 `https://api.deepseek.com/v1/chat/completions`, `https://openrouter.ai/api/v1/chat/completions`），请参考对应相关的 API 文档，确保路径正确
 3. 输入 API 密钥，并配置其他参数（如模型名称等）。由于目前还未充分测试，因此不一定能够适配所有 LLM 服务商，将在之后的更新中逐步支持。
 4. 启动 MateEngine 聊天功能，若代理服务器正常启动，输入框会从 loading 状态变为 Talk to me。注意，这并不意味着一定能请求成功，只有代理服务器能成功请求远程 LLM API 时，才能收到回复
 
 ## 未来计划
 
-- 支持流式响应（目前暂未启用，待修复相关 bug）
 - 更便捷的角色 Prompt 配置
 - 更多自定义参数（LLM 调用相关）
 - 更灵活的 API 配置方式，适配更多 LLM 服务商

@@ -1,4 +1,6 @@
-# MateEngine Custom LLM API Mod
+# [Mate Engine](https://github.com/shinyflvre/Mate-Engine) -  Custom LLM API
+
+**Other Language Versions: [English](README.md), [中文](README_zh.md)**
 
 ## Introduction
 
@@ -24,13 +26,12 @@ Similar to CustomDancePlayer installation steps, see [https://github.com/maoxig/
 ## User Guide
 
 1. Press `J` to open/close the configuration panel. After configuring, click Save to enable.
-2. Enter the API Endpoint (e.g., `https://api.openai.com/v1/chat/completions` or `https://api.deepseek.com/v1/chat/completions`). Refer to the relevant API documentation to ensure the path is correct.
+2. Enter the API Endpoint (e.g., `https://api.openai.com/v1/chat/completions` or `https://api.deepseek.com/v1/chat/completions`, `https://openrouter.ai/api/v1/chat/completions`). Refer to the relevant API documentation to ensure the path is correct.
 3. Enter the API key and configure other parameters (such as model name). As testing is still limited, not all LLM providers may be supported yet—future updates will improve compatibility.
 4. Start MateEngine's chat feature. If the proxy server starts successfully, the input box will change from loading to "Talk to me." Note: This does not guarantee successful requests; only when the proxy server successfully requests the remote LLM API will you receive a reply.
 
 ## Future Plans
 
-- Support for streaming responses (currently disabled, pending bug fixes)
 - More convenient character prompt configuration
 - More customizable parameters (LLM invocation related)
 - More flexible API configuration to support more LLM providers
